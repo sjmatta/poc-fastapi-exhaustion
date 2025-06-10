@@ -100,7 +100,11 @@ async def chat_stream(request: Request):
         async for chunk in response:  # ✅ async for
             if await request.is_disconnected():
                 break
-            yield f"data: {chunk}\n\n"
+            
+            # ✅ Correctly extract content from the chunk
+            content = chunk.choices[0].delta.content
+            if content:
+                yield f"data: {content}\n\n"
     
     return StreamingResponse(generate(), media_type="text/event-stream")
 ```
@@ -119,11 +123,19 @@ async def stream_litellm_response(request: Request, **kwargs):
             if await request.is_disconnected():
                 logger.info("Client disconnected")
                 break
-            yield chunk
+            
+            content = chunk.choices[0].delta.content
+            if content:
+                # ✅ Format as SSE
+                import json
+                yield f"data: {json.dumps({'content': content})}\n\n"
             
     except Exception as e:
         logger.error(f"LiteLLM error: {e}")
-        yield {"error": str(e)}
+        # ✅ Format error as SSE
+        import json
+        error_payload = json.dumps({"error": str(e)})
+        yield f"data: {error_payload}\n\n"
 
 @app.post("/chat/stream")
 async def chat_stream(request: Request):
@@ -272,8 +284,10 @@ async def stream_litellm_completion(
             
     except Exception as e:
         logger.error(f"LiteLLM streaming error: {e}")
-        # Yield error in SSE format
-        yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+        # ✅ Use json.dumps to safely create the JSON payload
+        import json
+        error_payload = json.dumps({"error": str(e)})
+        yield f"data: {error_payload}\n\n"
 ```
 
 ### Step 4: Gradual Migration
@@ -338,8 +352,20 @@ async def chat_stream(request: Request):
                 headers={"X-Stream-Method": "async_failure"}
             )
     else:
-        # Original blocking method
-        response = litellm.completion(model="gpt-4", messages=messages, stream=True)  
+        # Original blocking method - must use run_in_executor to avoid blocking event loop
+        import functools
+        import asyncio
+        
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,  # Use default thread pool
+            functools.partial(
+                litellm.completion, 
+                model="gpt-4", 
+                messages=messages, 
+                stream=True
+            )
+        )
         return StreamingResponse(response, headers={"X-Stream-Method": "blocking"})
 ```
 
@@ -359,35 +385,60 @@ import asyncio
 import httpx
 import time
 
+URL = "http://localhost:8000"
+PAYLOAD = {"messages": [{"role": "user", "content": "test"}]}
+
+async def consume_stream(client: httpx.AsyncClient):
+    """Establishes and consumes a single stream."""
+    try:
+        async with client.stream("POST", f"{URL}/chat/stream", json=PAYLOAD, timeout=60) as response:
+            response.raise_for_status()
+            async for _ in response.aiter_bytes():
+                pass  # Consume the data to keep the connection active
+    except httpx.HTTPStatusError as e:
+        print(f"Stream failed with status error: {e.response.status_code}")
+    except Exception as e:
+        print(f"An error occurred during streaming: {e}")
+
+async def health_check(client: httpx.AsyncClient):
+    """Performs a single sync health check."""
+    start = time.time()
+    await client.get(f"{URL}/debug/health-sync")
+    return time.time() - start
+
 async def load_test():
-    async def health_check():
-        async with httpx.AsyncClient() as client:
-            start = time.time()
-            await client.get("http://localhost:8000/debug/health-sync")
-            return time.time() - start
-    
-    # Start 10 concurrent streams
-    stream_tasks = []
-    for i in range(10):
-        async with httpx.AsyncClient() as client:
-            stream_tasks.append(
-                client.stream("POST", "http://localhost:8000/chat/stream", 
-                             json={"messages": [{"role": "user", "content": "test"}]})
-            )
-    
-    # Monitor health for 30 seconds
-    health_times = []
-    for i in range(30):
-        health_times.append(await health_check())
-        await asyncio.sleep(1)
-    
+    async with httpx.AsyncClient() as client:
+        # Start 40 concurrent streams to saturate the default thread pool
+        print("Starting 40 concurrent streams...")
+        stream_tasks = [
+            asyncio.create_task(consume_stream(client)) for _ in range(40)
+        ]
+
+        # Monitor health for 15 seconds while streams are active
+        health_times = []
+        for i in range(15):
+            if all(task.done() for task in stream_tasks):
+                print("All streams finished early.")
+                break
+            
+            health_times.append(await health_check(client))
+            print(f"[{i+1}/15] Health check time: {health_times[-1]:.4f}s")
+            await asyncio.sleep(1)
+        
+        # Clean up tasks
+        await asyncio.gather(*stream_tasks, return_exceptions=True)
+
+    if not health_times:
+        print("❌ FAIL: No health checks were performed. Test may have ended too quickly.")
+        return
+
     avg_health_time = sum(health_times) / len(health_times)
-    print(f"Average health check time: {avg_health_time:.3f}s")
+    print(f"\nAverage health check time under load: {avg_health_time:.3f}s")
     
-    if avg_health_time < 0.05:
-        print("✅ PASS: No thread exhaustion")
+    if avg_health_time < 0.1:
+        print("✅ PASS: No significant thread exhaustion detected.")
     else:
-        print("❌ FAIL: Thread exhaustion detected")
+        print("❌ FAIL: Thread exhaustion detected! Health checks are slow.")
 
 asyncio.run(load_test())
 ```
