@@ -17,7 +17,9 @@ async def async_stream_from_llm(request: Request) -> AsyncGenerator[bytes, None]
     print("✅ Starting async stream request (non-blocking)")
     
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        # ✅ Set reasonable timeout to prevent hung connections
+        timeout_config = httpx.Timeout(300.0, connect=60.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             async with client.stream(
                 "GET", 
                 "http://localhost:8001/slow_stream?chunks=20&delay=1.0"

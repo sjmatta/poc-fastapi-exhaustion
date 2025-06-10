@@ -9,7 +9,8 @@ from fastapi.responses import StreamingResponse
 
 # Create a deliberately small thread pool to demonstrate the problem
 # In real scenarios, this would be the default FastAPI thread pool getting exhausted
-LIMITED_THREAD_POOL = ThreadPoolExecutor(max_workers=4)
+MAX_WORKERS = 4
+LIMITED_THREAD_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 router = APIRouter(prefix="/api/v1", tags=["broken"])
 
@@ -75,7 +76,7 @@ async def info():
     """Information about the broken implementation"""
     return {
         "implementation": "broken",
-        "thread_pool_size": LIMITED_THREAD_POOL._max_workers,
+        "thread_pool_size": MAX_WORKERS,
         "problem": "Uses blocking requests library with limited thread pool",
         "symptoms": [
             "Thread exhaustion under concurrent load",

@@ -102,7 +102,7 @@ async def chat_stream(request: Request):
                 break
             yield f"data: {chunk}\n\n"
     
-    return StreamingResponse(generate())
+    return StreamingResponse(generate(), media_type="text/event-stream")
 ```
 
 **Solution 2: Proper async streaming wrapper**
@@ -132,7 +132,8 @@ async def chat_stream(request: Request):
             request,
             model="gpt-4", 
             messages=messages
-        )
+        ),
+        media_type="text/event-stream"
     )
 ```
 
@@ -264,7 +265,10 @@ async def stream_litellm_completion(
                 logger.info("Client disconnected, terminating LiteLLM stream")
                 break
             
-            yield chunk
+            # ✅ Process LiteLLM chunk to get actual content
+            content = chunk.choices[0].delta.content
+            if content:
+                yield f"data: {content}\n\n"
             
     except Exception as e:
         logger.error(f"LiteLLM streaming error: {e}")
@@ -309,6 +313,7 @@ async def chat_stream(request: Request):  # ✅ async def
 import os
 import random
 import logging
+from fastapi.responses import JSONResponse
 
 ASYNC_ROLLOUT_PERCENTAGE = int(os.getenv("ASYNC_ROLLOUT_PERCENTAGE", "0"))
 
@@ -324,10 +329,14 @@ async def chat_stream(request: Request):
                 headers={"X-Stream-Method": "async"}
             )
         except Exception as e:
-            logging.error(f"Async LiteLLM failed, falling back: {e}")
-            # Fallback to blocking method
-            response = litellm.completion(model="gpt-4", messages=messages, stream=True)
-            return StreamingResponse(response, headers={"X-Stream-Method": "fallback"})
+            logging.error(f"Async LiteLLM failed, returning 503: {e}")
+            # ❌ DO NOT FALL BACK TO BLOCKING CODE - this re-introduces thread exhaustion!
+            # ✅ FAIL FAST: Return error and let monitoring handle the issue
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Service temporarily unavailable. Please try again later."},
+                headers={"X-Stream-Method": "async_failure"}
+            )
     else:
         # Original blocking method
         response = litellm.completion(model="gpt-4", messages=messages, stream=True)  
