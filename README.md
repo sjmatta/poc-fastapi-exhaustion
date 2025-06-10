@@ -1,14 +1,16 @@
-# FastAPI Thread Exhaustion Reproduction
+# FastAPI Thread Exhaustion with LiteLLM Streaming
 
-Demonstrates the critical thread exhaustion issue in FastAPI applications that stream responses from external services like LiteLLM, and provides the solution.
+Demonstrates the critical thread exhaustion issue in FastAPI applications using blocking patterns with LiteLLM streaming, and provides the solution.
+
+**Key insight:** The problem occurs at **~30-40 concurrent streams** and is usually caused by using `def` instead of `async def` or `litellm.completion()` instead of `litellm.acompletion()`.
 
 ## 🔥 The Problem
 
-FastAPI apps using blocking HTTP clients (`requests`) to stream from external services experience **thread pool exhaustion**:
+FastAPI apps using blocking patterns for streaming from external services experience **thread pool exhaustion**:
 
-- Health endpoints become slow/unresponsive  
-- Only 4-40 concurrent requests supported
-- Entire application becomes unavailable
+- Health endpoints become slow/unresponsive at **~30+ concurrent streams**
+- Thread pool (default 40 threads) gets saturated by long-running requests  
+- Entire application becomes unavailable at **~40-50 concurrent streams**
 
 ## ✅ The Solution
 
@@ -36,39 +38,102 @@ make stop
 |--------|-------------|------------|
 | **Health Response Time** | **0.12s (slow!)** | **0.01s (fast)** |
 | **Thread Pool Usage** | **100% saturated** | **0% (async)** |
-| **Concurrent Streams** | **4 max** | **Unlimited** |
+| **Concurrent Streams** | **~40 max (real apps)** | **Unlimited** |
 
 ## 🔍 Technical Details
 
-### The Problem Code
-```python
-# app/routers/broken.py - BLOCKS THREADS
-def blocking_stream_from_llm():
-    with requests.get("http://localhost:8001/slow_stream", stream=True) as response:
-        for chunk in response.iter_content():
-            yield chunk  # ❌ Holds thread for 45+ seconds
+### The Real Problem Patterns
 
-@router.get("/chat/stream")
-async def chat_stream_broken():
-    # ❌ Uses limited 4-thread pool
-    return await loop.run_in_executor(LIMITED_THREAD_POOL, blocking_stream_from_llm)
+**Pattern 1: Using `def` instead of `async def`**
+```python
+# ❌ WRONG - Forces FastAPI to use thread pool
+@app.post("/chat/stream")
+def chat_stream():  # def = blocking = uses thread
+    response = litellm.completion(
+        model="gpt-4",
+        messages=messages,
+        stream=True
+    )
+    return StreamingResponse(response)  # Holds thread for 30-60s
 ```
 
-### The Solution Code
+**Pattern 2: Not using async LiteLLM methods**
 ```python
-# app/routers/fixed.py - ASYNC NON-BLOCKING
-async def async_stream_from_llm(request: Request):
-    async with httpx.AsyncClient() as client:
-        async with client.stream("GET", "http://localhost:8001/slow_stream") as response:
-            async for chunk in response.aiter_bytes():  # ✅ Yields control
-                if await request.is_disconnected():
-                    break
-                yield chunk
+# ❌ WRONG - Blocking call in async function
+@app.post("/chat/stream") 
+async def chat_stream():
+    response = litellm.completion(  # This is blocking!
+        model="gpt-4",
+        messages=messages, 
+        stream=True
+    )
+    return StreamingResponse(response)
+```
 
-@router.get("/chat/stream")
-async def chat_stream_fixed(request: Request):
-    # ✅ Pure async - no threads needed
-    return StreamingResponse(async_stream_from_llm(request))
+**Pattern 3: Using requests with LiteLLM REST API**
+```python
+# ❌ WRONG - Direct REST API calls with requests
+@app.post("/chat/stream")
+async def chat_stream():
+    response = requests.post(  # Blocking requests
+        "https://api.litellm.com/chat/completions",
+        json=payload,
+        stream=True
+    )
+    return StreamingResponse(response.iter_content())
+```
+
+### The Correct Solutions
+
+**Solution 1: Use `async def` with LiteLLM**
+```python
+# ✅ CORRECT - Async endpoint
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    response = await litellm.acompletion(  # ✅ Use acompletion
+        model="gpt-4",
+        messages=messages,
+        stream=True
+    )
+    
+    async def generate():
+        async for chunk in response:  # ✅ async for
+            if await request.is_disconnected():
+                break
+            yield f"data: {chunk}\n\n"
+    
+    return StreamingResponse(generate())
+```
+
+**Solution 2: Proper async streaming wrapper**
+```python
+# ✅ CORRECT - Handle streaming properly
+import litellm
+
+async def stream_litellm_response(request: Request, **kwargs):
+    """Async wrapper for LiteLLM streaming"""
+    try:
+        response = await litellm.acompletion(stream=True, **kwargs)
+        
+        async for chunk in response:
+            if await request.is_disconnected():
+                logger.info("Client disconnected")
+                break
+            yield chunk
+            
+    except Exception as e:
+        logger.error(f"LiteLLM error: {e}")
+        yield {"error": str(e)}
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    return StreamingResponse(
+        stream_litellm_response(
+            request,
+            model="gpt-4", 
+            messages=messages
+        )
+    )
 ```
 
 ## 🛠️ Project Structure
@@ -158,70 +223,53 @@ done
 
 **If you see sync health checks become slow (>0.1s), you have thread exhaustion.**
 
-### Step 3: Drop-In Async Solution
+### Step 3: Use Proper LiteLLM Async Methods
+
+**Key changes needed:**
+
+1. **Use `litellm.acompletion()` instead of `litellm.completion()`**
+2. **Use `async def` for all streaming endpoints**  
+3. **Use `async for` to iterate over response chunks**
+4. **Add client disconnect detection**
 
 **Create `utils/async_streaming.py`:**
 
 ```python
-import httpx
-import asyncio
+import litellm
+import logging
 from typing import AsyncGenerator, Dict, Any
 from fastapi import Request
-import logging
 
 logger = logging.getLogger(__name__)
 
-class AsyncLiteLLMClient:
-    def __init__(self):
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=None),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-            http2=True
+async def stream_litellm_completion(
+    request: Request, 
+    model: str,
+    messages: list,
+    **kwargs
+) -> AsyncGenerator[str, None]:
+    """Async wrapper for LiteLLM streaming that handles disconnects"""
+    try:
+        # Use acompletion for async streaming
+        response = await litellm.acompletion(
+            model=model,
+            messages=messages,
+            stream=True,
+            **kwargs
         )
-    
-    async def stream_chat_completion(
-        self, 
-        request: Request,
-        url: str,
-        headers: Dict[str, str],
-        payload: Dict[str, Any],
-        chunk_size: int = 1024
-    ) -> AsyncGenerator[bytes, None]:
-        """Drop-in replacement for requests streaming"""
-        try:
-            async with self.client.stream(
-                "POST", url, json=payload, headers=headers
-            ) as response:
-                
-                if response.status_code >= 400:
-                    error_text = await response.atext()
-                    logger.error(f"LiteLLM API error {response.status_code}: {error_text}")
-                    yield f"data: {{\"error\": \"API error: {response.status_code}\"}}\n\n".encode()
-                    return
-                
-                async for chunk in response.aiter_bytes(chunk_size):
-                    # Critical: Check for client disconnect
-                    if await request.is_disconnected():
-                        logger.info("Client disconnected, terminating stream")
-                        break
-                    
-                    if chunk:
-                        yield chunk
-                        
-        except httpx.TimeoutException:
-            logger.error("LiteLLM request timed out")
-            yield f"data: {{\"error\": \"Request timeout\"}}\n\n".encode()
-        except Exception as e:
-            logger.error(f"Unexpected error in stream: {e}")
-            yield f"data: {{\"error\": \"Internal error\"}}\n\n".encode()
-
-# Global instance
-async_client = AsyncLiteLLMClient()
-
-async def async_litellm_stream(request: Request, url: str, headers: dict, payload: dict):
-    """One-line replacement for existing streaming code"""
-    async for chunk in async_client.stream_chat_completion(request, url, headers, payload):
-        yield chunk
+        
+        async for chunk in response:
+            # Critical: Check for client disconnect
+            if await request.is_disconnected():
+                logger.info("Client disconnected, terminating LiteLLM stream")
+                break
+            
+            yield chunk
+            
+    except Exception as e:
+        logger.error(f"LiteLLM streaming error: {e}")
+        # Yield error in SSE format
+        yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
 ```
 
 ### Step 4: Gradual Migration
@@ -229,18 +277,27 @@ async def async_litellm_stream(request: Request, url: str, headers: dict, payloa
 **Replace your existing streaming endpoints:**
 
 ```python
-# BEFORE (your current code)
+# BEFORE (blocking patterns)
 @app.post("/chat/stream")
-async def chat_stream():
-    return StreamingResponse(your_blocking_function())
+def chat_stream():  # ❌ def = uses thread pool
+    response = litellm.completion(  # ❌ blocking call
+        model="gpt-4",
+        messages=messages,
+        stream=True
+    )
+    return StreamingResponse(response)
 
-# AFTER (add request parameter and use async)
-from utils.async_streaming import async_litellm_stream
+# AFTER (async patterns)
+from utils.async_streaming import stream_litellm_completion
 
 @app.post("/chat/stream") 
-async def chat_stream(request: Request):
+async def chat_stream(request: Request):  # ✅ async def
     return StreamingResponse(
-        async_litellm_stream(request, url, headers, payload)
+        stream_litellm_completion(  # ✅ async wrapper
+            request, 
+            model="gpt-4",
+            messages=messages
+        )
     )
 ```
 
@@ -251,6 +308,7 @@ async def chat_stream(request: Request):
 ```python
 import os
 import random
+import logging
 
 ASYNC_ROLLOUT_PERCENTAGE = int(os.getenv("ASYNC_ROLLOUT_PERCENTAGE", "0"))
 
@@ -260,16 +318,20 @@ async def chat_stream(request: Request):
     
     if use_async:
         try:
+            # Use async LiteLLM
             return StreamingResponse(
-                async_litellm_stream(request, url, headers, payload),
+                stream_litellm_completion(request, model="gpt-4", messages=messages),
                 headers={"X-Stream-Method": "async"}
             )
         except Exception as e:
-            logging.error(f"Async streaming failed, falling back: {e}")
-            # Fallback to old method
-            return StreamingResponse(your_old_blocking_function())
+            logging.error(f"Async LiteLLM failed, falling back: {e}")
+            # Fallback to blocking method
+            response = litellm.completion(model="gpt-4", messages=messages, stream=True)
+            return StreamingResponse(response, headers={"X-Stream-Method": "fallback"})
     else:
-        return StreamingResponse(your_old_blocking_function())
+        # Original blocking method
+        response = litellm.completion(model="gpt-4", messages=messages, stream=True)  
+        return StreamingResponse(response, headers={"X-Stream-Method": "blocking"})
 ```
 
 **Deploy sequence:**
@@ -324,12 +386,15 @@ asyncio.run(load_test())
 ### Critical Migration Checklist
 
 - [ ] Add enhanced health check with thread pool monitoring
-- [ ] Install httpx: `pip install httpx`
-- [ ] Create async streaming utility
+- [ ] **Change `def` endpoints to `async def`**
+- [ ] **Replace `litellm.completion()` with `litellm.acompletion()`**
+- [ ] **Use `async for` to iterate over LiteLLM response chunks**
+- [ ] **Add `await request.is_disconnected()` checks**
+- [ ] Create async streaming utility wrapper
 - [ ] Test with feature flag at 5% traffic
-- [ ] Monitor health check latency during rollout
+- [ ] Monitor health check latency during rollout  
 - [ ] Gradually increase rollout percentage
 - [ ] Validate memory usage and connection handling
-- [ ] Remove blocking code after 100% rollout
+- [ ] Remove blocking patterns after 100% rollout
 
-**This approach lets you validate the fix incrementally without disrupting your production traffic.**
+**Key insight: The problem is usually `def` vs `async def` and `completion()` vs `acompletion()`, not the HTTP client itself.**
